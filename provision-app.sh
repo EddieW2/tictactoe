@@ -1,46 +1,79 @@
+
 #!/bin/bash
-# Update and upgrade
-sudo apt update
-sudo apt upgrade -y
 
-# Installs packages
-sudo apt install unzip nginx git -y
+# Stop the script if a command fails, and log all output.
+set -Ee
+exec > >(tee -a /var/log/user-data-deploy.log) 2>&1
 
-# Download nodejs
-# and  save it in the file nodesource_setup.sh
-curl -sL https://deb.nodesource.com/setup_20.x -o nodesource_setup.sh
+echo "Starting Tic-Tac-Toe deployment..."
 
-# Run the Nodejs with administrator privileges
-sudo bash nodesource_setup.sh
+# Update Ubuntu and install required packages.
+apt-get update
+apt-get upgrade -y
+apt-get install -y curl unzip nginx git
 
-# Install Node.js and pm2
-sudo apt install nodejs -y
-sudo npm install -g pm2
+# Install Node.js 20.
+curl -fsSL https://deb.nodesource.com/setup_20.x \
+    -o /tmp/nodesource_setup.sh
+bash /tmp/nodesource_setup.sh
+apt-get install -y nodejs
 
-# clone each run
-cd ~
+# Install PM2.
+npm install -g pm2
+
+# Clone the application from GitHub.
+cd /home/ubuntu
 rm -rf tictactoe
 git clone https://github.com/EddieW/tictactoe.git
 cd tictactoe
 
-# Unzip 
-if [ -f nodejs20-sparta-tictactoe-v1.zip ]; then
-    unzip -o nodejs20-sparta-tictactoe-v1.zip
-    cd app
-    npm install
-
-    # Remove any existing tictactoe web-apps
-    pm2 delete tictactoe || true
-
-    # Start the app changes name
-    pm2 start index.js --name tictactoe
-
-    # Reverse proxy
-    sudo sed -i 's|try_files \$uri \$uri/ =404;|proxy_pass http://localhost:3000;|' /etc/nginx/sites-available/default
-
-    # config is valid, and only reload nginx if it is
-    sudo nginx -t && sudo systemctl reload nginx         
-
-else
-    echo "Cannot find zip file needed"
+# Check that the expected ZIP file exists.
+if [ ! -f nodejs20-sparta-tictactoe-v1.zip ]; then
+    echo "ERROR: Application ZIP file not found."
+    exit 1
 fi
+
+# Extract the application.
+unzip -o nodejs20-sparta-tictactoe-v1.zip -d /home/ubuntu/tictactoe
+cd /home/ubuntu/tictactoe/app
+
+# Install Node.js dependencies.
+npm install
+
+# Run PM2 as the ubuntu user, not root.
+chown -R ubuntu:ubuntu /home/ubuntu/tictactoe
+
+# Start or replace the application.
+runuser -u ubuntu -- pm2 delete tictactoe || true
+runuser -u ubuntu -- pm2 start index.js --name tictactoe
+
+# Configure PM2 to restore the app after reboot.
+runuser -u ubuntu -- pm2 save
+env PATH="$PATH:/usr/bin" runuser -u ubuntu -- pm2 startup systemd -u ubuntu --hp /home/ubuntu
+
+# Configure Nginx as a reverse proxy.
+cat > /etc/nginx/sites-available/default <<'NGINX'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    server_name _;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+NGINX
+
+# Validate Nginx before restarting it.
+nginx -t
+systemctl enable nginx
+systemctl restart nginx
+
+echo "Tic-Tac-Toe deployment completed."
